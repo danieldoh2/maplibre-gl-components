@@ -35,12 +35,19 @@ export default defineConfig({
     }),
   ],
   optimizeDeps: {
-    esbuildOptions: {
+    rolldownOptions: {
       // Avoid downleveling class fields in maplibre-gl worker bundle (prevents __publicField errors).
-      target: "es2022",
+      transform: {
+        target: "es2022",
+      },
     },
   },
   base: "/maplibre-gl-components/",
+  worker: {
+    // Emit workers as ES modules so top-level await in worker deps
+    // (e.g. @developmentseed/geotiff pool) is supported under rolldown.
+    format: "es",
+  },
   build: {
     target: "es2022",
     outDir: "dist-examples",

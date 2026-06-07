@@ -11,6 +11,10 @@ import type {
   PrintEvent,
   PrintEventHandler,
   PrintColorbarConfig,
+  PrintPageSize,
+  PrintOrientation,
+  PrintFitMode,
+  PrintFormat,
   ColormapName,
   ColorStop,
 } from "./types";
@@ -56,21 +60,43 @@ const DEFAULT_OPTIONS: Required<Omit<PrintControlOptions, "colorbar">> & {
   showSizeOptions: false,
   width: 0,
   height: 0,
+  pageSize: "fit",
+  orientation: "auto",
+  dpi: 96,
+  margin: 0,
+  pageBackground: "#ffffff",
+  fitMode: "contain",
+  showPageOptions: false,
   panelWidth: 280,
   maxHeight: 500,
-  backgroundColor: "rgba(255, 255, 255, 0.95)",
+  backgroundColor: "",
   borderRadius: 4,
   opacity: 1,
   fontSize: 12,
-  fontColor: "#333",
+  fontColor: "",
   minzoom: 0,
   maxzoom: 24,
 };
 
 /**
- * SVG icon for the camera/print button.
+ * SVG printer icon for the export/print button.
  */
-const CAMERA_ICON = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>`;
+const PRINTER_ICON = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 6 2 18 2 18 9"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8"/></svg>`;
+
+/**
+ * Physical paper sizes in inches (portrait orientation: width x height).
+ */
+const PAGE_SIZES_INCHES: Record<
+  Exclude<PrintPageSize, "fit">,
+  [number, number]
+> = {
+  a3: [11.69, 16.54],
+  a4: [8.27, 11.69],
+  a5: [5.83, 8.27],
+  letter: [8.5, 11],
+  legal: [8.5, 14],
+  tabloid: [11, 17],
+};
 
 /**
  * SVG icon for close button.
@@ -86,6 +112,38 @@ const DOWNLOAD_ICON = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 2
  * SVG icon for clipboard copy.
  */
 const CLIPBOARD_ICON = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>`;
+
+/**
+ * A rectangle in export-canvas pixel coordinates.
+ */
+interface Rect {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+/**
+ * Resolved layout for an export page.
+ */
+interface PageLayout {
+  /** Export canvas width in pixels. */
+  pageW: number;
+  /** Export canvas height in pixels. */
+  pageH: number;
+  /** Content area (page minus margins) where overlays are positioned. */
+  content: Rect;
+  /** Destination rectangle the map image is drawn into. */
+  mapDest: Rect;
+  /** Export pixels per source map pixel (used for an accurate scale bar). */
+  scaleX: number;
+  /** Whether the map is clipped to the content rect (cover/crop mode). */
+  clip: boolean;
+  /** Physical page width in inches (null when unknown). */
+  pageWidthIn: number | null;
+  /** Physical page height in inches (null when unknown). */
+  pageHeightIn: number | null;
+}
 
 /**
  * A control for exporting the current map view as an image.
@@ -138,6 +196,12 @@ export class PrintControl implements IControl {
   private _widthInput?: HTMLInputElement;
   private _heightInput?: HTMLInputElement;
   private _customSizeInputs?: HTMLElement;
+  private _pageSizeSelect?: HTMLSelectElement;
+  private _orientationSelect?: HTMLSelectElement;
+  private _dpiSelect?: HTMLSelectElement;
+  private _marginInput?: HTMLInputElement;
+  private _fitModeSelect?: HTMLSelectElement;
+  private _pageBackgroundInput?: HTMLInputElement;
   private _exportBtn?: HTMLButtonElement;
   private _copyBtn?: HTMLButtonElement;
   private _feedbackEl?: HTMLElement;
@@ -161,6 +225,12 @@ export class PrintControl implements IControl {
       exporting: false,
       width: this._options.width || null,
       height: this._options.height || null,
+      pageSize: this._options.pageSize,
+      orientation: this._options.orientation,
+      dpi: this._options.dpi,
+      margin: this._options.margin,
+      pageBackground: this._options.pageBackground,
+      fitMode: this._options.fitMode,
     };
   }
 
@@ -252,7 +322,7 @@ export class PrintControl implements IControl {
     this._button.type = "button";
     this._button.className = "print-button";
     this._button.title = "Export Map";
-    this._button.innerHTML = CAMERA_ICON;
+    this._button.innerHTML = PRINTER_ICON;
     this._button.addEventListener("click", () => this._togglePanel());
     container.appendChild(this._button);
 
@@ -270,10 +340,16 @@ export class PrintControl implements IControl {
       panel.style.maxHeight = `${this._options.maxHeight}px`;
       panel.style.overflowY = "auto";
     }
-    panel.style.background = this._options.backgroundColor;
+    // Only force colors when explicitly provided; otherwise the CSS custom
+    // properties drive them so the panel adapts to the system theme.
+    if (this._options.backgroundColor) {
+      panel.style.background = this._options.backgroundColor;
+    }
     panel.style.borderRadius = `${this._options.borderRadius}px`;
     panel.style.fontSize = `${this._options.fontSize}px`;
-    panel.style.color = this._options.fontColor;
+    if (this._options.fontColor) {
+      panel.style.color = this._options.fontColor;
+    }
 
     // Header
     const header = document.createElement("div");
@@ -298,7 +374,7 @@ export class PrintControl implements IControl {
     this._titleInput = document.createElement("input");
     this._titleInput.type = "text";
     this._titleInput.className = "print-input";
-    this._titleInput.style.color = "#000";
+    this._titleInput.style.color = "var(--print-input-text)";
     this._titleInput.placeholder = "Enter a title...";
     this._titleInput.value = this._state.title;
     this._titleInput.addEventListener("input", () => {
@@ -367,7 +443,7 @@ export class PrintControl implements IControl {
     this._colorbarColormapSelect = document.createElement("select");
     this._colorbarColormapSelect.className =
       "print-select print-colorbar-select";
-    this._colorbarColormapSelect.style.color = "#000";
+    this._colorbarColormapSelect.style.color = "var(--print-input-text)";
     const colormapNames = getColormapNames();
     colormapNames.forEach((name) => {
       const opt = document.createElement("option");
@@ -393,7 +469,7 @@ export class PrintControl implements IControl {
     this._colorbarOrientationSelect = document.createElement("select");
     this._colorbarOrientationSelect.className =
       "print-select print-colorbar-select";
-    this._colorbarOrientationSelect.style.color = "#000";
+    this._colorbarOrientationSelect.style.color = "var(--print-input-text)";
     const orientations: Array<"horizontal" | "vertical"> = [
       "horizontal",
       "vertical",
@@ -423,7 +499,7 @@ export class PrintControl implements IControl {
     this._colorbarVminInput = document.createElement("input");
     this._colorbarVminInput.type = "number";
     this._colorbarVminInput.className = "print-input print-colorbar-num";
-    this._colorbarVminInput.style.color = "#000";
+    this._colorbarVminInput.style.color = "var(--print-input-text)";
     this._colorbarVminInput.value = String(this._state.colorbar.vmin ?? 0);
     this._colorbarVminInput.addEventListener("input", () => {
       this._state.colorbar.vmin =
@@ -435,7 +511,7 @@ export class PrintControl implements IControl {
     this._colorbarVmaxInput = document.createElement("input");
     this._colorbarVmaxInput.type = "number";
     this._colorbarVmaxInput.className = "print-input print-colorbar-num";
-    this._colorbarVmaxInput.style.color = "#000";
+    this._colorbarVmaxInput.style.color = "var(--print-input-text)";
     this._colorbarVmaxInput.value = String(this._state.colorbar.vmax ?? 1);
     this._colorbarVmaxInput.addEventListener("input", () => {
       this._state.colorbar.vmax =
@@ -456,7 +532,7 @@ export class PrintControl implements IControl {
     this._colorbarLabelInput = document.createElement("input");
     this._colorbarLabelInput.type = "text";
     this._colorbarLabelInput.className = "print-input";
-    this._colorbarLabelInput.style.color = "#000";
+    this._colorbarLabelInput.style.color = "var(--print-input-text)";
     this._colorbarLabelInput.placeholder = "e.g., Temperature";
     this._colorbarLabelInput.value = this._state.colorbar.label ?? "";
     this._colorbarLabelInput.addEventListener("input", () => {
@@ -475,7 +551,7 @@ export class PrintControl implements IControl {
     this._colorbarUnitsInput = document.createElement("input");
     this._colorbarUnitsInput.type = "text";
     this._colorbarUnitsInput.className = "print-input print-colorbar-units";
-    this._colorbarUnitsInput.style.color = "#000";
+    this._colorbarUnitsInput.style.color = "var(--print-input-text)";
     this._colorbarUnitsInput.placeholder = "e.g., °C";
     this._colorbarUnitsInput.value = this._state.colorbar.units ?? "";
     this._colorbarUnitsInput.addEventListener("input", () => {
@@ -495,7 +571,7 @@ export class PrintControl implements IControl {
     this._filenameInput = document.createElement("input");
     this._filenameInput.type = "text";
     this._filenameInput.className = "print-input";
-    this._filenameInput.style.color = "#000";
+    this._filenameInput.style.color = "var(--print-input-text)";
     this._filenameInput.value = this._state.filename;
     this._filenameInput.addEventListener("input", () => {
       this._state.filename = this._filenameInput!.value || "map-export";
@@ -513,14 +589,15 @@ export class PrintControl implements IControl {
     formatField.innerHTML = `<label>Format</label>`;
     this._formatSelect = document.createElement("select");
     this._formatSelect.className = "print-select";
-    this._formatSelect.style.color = "#000";
+    this._formatSelect.style.color = "var(--print-input-text)";
     this._formatSelect.innerHTML = `
       <option value="png" ${this._state.format === "png" ? "selected" : ""}>PNG</option>
       <option value="jpeg" ${this._state.format === "jpeg" ? "selected" : ""}>JPEG</option>
       <option value="pdf" ${this._state.format === "pdf" ? "selected" : ""}>PDF</option>
+      <option value="svg" ${this._state.format === "svg" ? "selected" : ""}>SVG</option>
     `;
     this._formatSelect.addEventListener("change", () => {
-      this._state.format = this._formatSelect!.value as "png" | "jpeg" | "pdf";
+      this._state.format = this._formatSelect!.value as PrintFormat;
       this._updateQualityVisibility();
       this._updateCopyBtnVisibility();
     });
@@ -536,7 +613,7 @@ export class PrintControl implements IControl {
     this._qualityInput = document.createElement("input");
     this._qualityInput.type = "range";
     this._qualityInput.className = "print-quality-range";
-    this._qualityInput.style.color = "#000";
+    this._qualityInput.style.color = "var(--print-input-text)";
     this._qualityInput.min = "0.1";
     this._qualityInput.max = "1";
     this._qualityInput.step = "0.01";
@@ -616,7 +693,7 @@ export class PrintControl implements IControl {
       this._widthInput = document.createElement("input");
       this._widthInput.type = "number";
       this._widthInput.className = "print-size-input";
-      this._widthInput.style.color = "#000";
+      this._widthInput.style.color = "var(--print-input-text)";
       this._widthInput.min = "1";
       this._widthInput.max = "8192";
       this._widthInput.value = String(this._state.width || 1920);
@@ -634,7 +711,7 @@ export class PrintControl implements IControl {
       this._heightInput = document.createElement("input");
       this._heightInput.type = "number";
       this._heightInput.className = "print-size-input";
-      this._heightInput.style.color = "#000";
+      this._heightInput.style.color = "var(--print-input-text)";
       this._heightInput.min = "1";
       this._heightInput.max = "8192";
       this._heightInput.value = String(this._state.height || 1080);
@@ -652,6 +729,15 @@ export class PrintControl implements IControl {
       sizeField.appendChild(this._customSizeInputs);
       content.appendChild(sizeField);
       this._updateCustomSizeVisibility();
+    }
+
+    // Page options
+    if (this._options.showPageOptions) {
+      const pageField = document.createElement("div");
+      pageField.className = "print-field";
+      pageField.innerHTML = `<label>Page</label>`;
+      pageField.appendChild(this._createPageOptions());
+      content.appendChild(pageField);
     }
 
     // Export button
@@ -682,6 +768,163 @@ export class PrintControl implements IControl {
   }
 
   /**
+   * Create a labeled field wrapping a control element.
+   */
+  private _makeField(labelText: string, control: HTMLElement): HTMLElement {
+    const field = document.createElement("div");
+    field.className = "print-field";
+    const label = document.createElement("label");
+    label.textContent = labelText;
+    field.appendChild(label);
+    field.appendChild(control);
+    return field;
+  }
+
+  /**
+   * Create a styled select element from value/label option pairs.
+   */
+  private _makeSelect(
+    options: Array<[string, string]>,
+    selected: string,
+  ): HTMLSelectElement {
+    const select = document.createElement("select");
+    select.className = "print-select";
+    select.style.color = "var(--print-input-text)";
+    options.forEach(([value, text]) => {
+      const opt = document.createElement("option");
+      opt.value = value;
+      opt.textContent = text;
+      opt.selected = value === selected;
+      select.appendChild(opt);
+    });
+    return select;
+  }
+
+  /**
+   * Normalize a color string to a 6-digit hex value usable by `<input type="color">`.
+   */
+  private _toHexColor(color: string): string {
+    return /^#[0-9a-fA-F]{6}$/.test(color) ? color : "#ffffff";
+  }
+
+  /**
+   * Create the page options section (size, orientation, DPI, margin, fit, background).
+   */
+  private _createPageOptions(): HTMLElement {
+    const wrapper = document.createElement("div");
+
+    // Row 1: Page size + Orientation
+    const row1 = document.createElement("div");
+    row1.className = "print-row";
+
+    this._pageSizeSelect = this._makeSelect(
+      [
+        ["fit", "Fit to map"],
+        ["a3", "A3"],
+        ["a4", "A4"],
+        ["a5", "A5"],
+        ["letter", "Letter"],
+        ["legal", "Legal"],
+        ["tabloid", "Tabloid"],
+      ],
+      this._state.pageSize,
+    );
+    this._pageSizeSelect.addEventListener("change", () => {
+      this._state.pageSize = this._pageSizeSelect!.value as PrintPageSize;
+      this._updatePageOptionsDisabled();
+    });
+    row1.appendChild(this._makeField("Page size", this._pageSizeSelect));
+
+    this._orientationSelect = this._makeSelect(
+      [
+        ["auto", "Auto"],
+        ["portrait", "Portrait"],
+        ["landscape", "Landscape"],
+      ],
+      this._state.orientation,
+    );
+    this._orientationSelect.addEventListener("change", () => {
+      this._state.orientation = this._orientationSelect!
+        .value as PrintOrientation;
+    });
+    row1.appendChild(this._makeField("Orientation", this._orientationSelect));
+    wrapper.appendChild(row1);
+
+    // Row 2: DPI + Margin
+    const row2 = document.createElement("div");
+    row2.className = "print-row";
+
+    this._dpiSelect = this._makeSelect(
+      [
+        ["72", "72"],
+        ["96", "96"],
+        ["150", "150"],
+        ["300", "300"],
+        ["600", "600"],
+      ],
+      String(this._state.dpi),
+    );
+    this._dpiSelect.addEventListener("change", () => {
+      this._state.dpi = parseInt(this._dpiSelect!.value, 10) || 96;
+    });
+    row2.appendChild(this._makeField("DPI", this._dpiSelect));
+
+    this._marginInput = document.createElement("input");
+    this._marginInput.type = "number";
+    this._marginInput.className = "print-input";
+    this._marginInput.style.color = "var(--print-input-text)";
+    this._marginInput.min = "0";
+    this._marginInput.value = String(this._state.margin);
+    this._marginInput.addEventListener("input", () => {
+      this._state.margin = Math.max(0, parseFloat(this._marginInput!.value) || 0);
+    });
+    row2.appendChild(this._makeField("Margin (pt)", this._marginInput));
+    wrapper.appendChild(row2);
+
+    // Row 3: Fit mode + Background
+    const row3 = document.createElement("div");
+    row3.className = "print-row";
+
+    this._fitModeSelect = this._makeSelect(
+      [
+        ["contain", "Contain"],
+        ["cover", "Cover"],
+      ],
+      this._state.fitMode,
+    );
+    this._fitModeSelect.addEventListener("change", () => {
+      this._state.fitMode = this._fitModeSelect!.value as PrintFitMode;
+    });
+    row3.appendChild(this._makeField("Fit", this._fitModeSelect));
+
+    this._pageBackgroundInput = document.createElement("input");
+    this._pageBackgroundInput.type = "color";
+    this._pageBackgroundInput.className = "print-input";
+    this._pageBackgroundInput.value = this._toHexColor(
+      this._state.pageBackground,
+    );
+    this._pageBackgroundInput.addEventListener("input", () => {
+      this._state.pageBackground = this._pageBackgroundInput!.value;
+    });
+    row3.appendChild(this._makeField("Background", this._pageBackgroundInput));
+    wrapper.appendChild(row3);
+
+    this._updatePageOptionsDisabled();
+    return wrapper;
+  }
+
+  /**
+   * Disable page options that have no effect in the legacy 'fit' page mode.
+   */
+  private _updatePageOptionsDisabled(): void {
+    const isFit = this._state.pageSize === "fit";
+    if (this._orientationSelect) this._orientationSelect.disabled = isFit;
+    if (this._fitModeSelect) this._fitModeSelect.disabled = isFit;
+    if (this._marginInput) this._marginInput.disabled = isFit;
+    if (this._pageBackgroundInput) this._pageBackgroundInput.disabled = isFit;
+  }
+
+  /**
    * Toggle quality field visibility based on format.
    */
   private _updateQualityVisibility(): void {
@@ -692,37 +935,215 @@ export class PrintControl implements IControl {
   }
 
   /**
-   * Toggle copy button visibility (hidden for PDF format).
+   * Toggle copy button visibility (hidden for vector/document formats).
    */
   private _updateCopyBtnVisibility(): void {
     if (this._copyBtn) {
-      this._copyBtn.style.display = this._state.format === "pdf" ? "none" : "";
+      const format = this._state.format;
+      this._copyBtn.style.display =
+        format === "pdf" || format === "svg" ? "none" : "";
     }
   }
 
   /**
-   * Export the canvas to a PDF file using jspdf.
+   * Resolve the DPI used for physical sizing (PDF points, SVG inches, raster
+   * metadata). `dpi` is ignored in the legacy `'fit'` page mode, so a fixed
+   * 96 DPI is used there to keep that output deterministic.
+   *
+   * @returns The effective dots-per-inch.
+   */
+  private _effectiveDpi(): number {
+    if (this._state.pageSize === "fit") return 96;
+    return this._state.dpi > 0 ? this._state.dpi : 96;
+  }
+
+  /**
+   * Export the canvas to a PDF file using jspdf. The composed canvas already
+   * represents the full page (page size, margins, and overlays baked in), so
+   * the PDF page is sized to match and the image fills it edge to edge.
+   *
+   * @param canvas - The composed export canvas.
    */
   private async _exportPdf(canvas: HTMLCanvasElement): Promise<void> {
     const { jsPDF } = await import("jspdf");
-    const imgWidth = canvas.width;
-    const imgHeight = canvas.height;
-    const orientation = imgWidth >= imgHeight ? "landscape" : "portrait";
-    const pdf = new jsPDF({ orientation, unit: "pt", format: "a4" });
+    const dpi = this._effectiveDpi();
+    // Convert the page pixel dimensions to points (1 pt = 1/72 inch).
+    const widthPt = (canvas.width / dpi) * 72;
+    const heightPt = (canvas.height / dpi) * 72;
+
+    // Pass the format in portrait order (short, long) and let the orientation
+    // flag rotate it; jsPDF normalizes array formats, so we read the resolved
+    // page size back rather than assuming the dimension order is preserved.
+    const orientation = widthPt >= heightPt ? "landscape" : "portrait";
+    const pdf = new jsPDF({
+      orientation,
+      unit: "pt",
+      format: [Math.min(widthPt, heightPt), Math.max(widthPt, heightPt)],
+    });
 
     const pageWidth = pdf.internal.pageSize.getWidth();
     const pageHeight = pdf.internal.pageSize.getHeight();
-
-    // Fit image within the page while maintaining aspect ratio
-    const scale = Math.min(pageWidth / imgWidth, pageHeight / imgHeight);
-    const w = imgWidth * scale;
-    const h = imgHeight * scale;
-    const x = (pageWidth - w) / 2;
-    const y = (pageHeight - h) / 2;
-
     const imgData = canvas.toDataURL("image/png");
-    pdf.addImage(imgData, "PNG", x, y, w, h);
+    pdf.addImage(imgData, "PNG", 0, 0, pageWidth, pageHeight);
     pdf.save(`${this._state.filename}.pdf`);
+  }
+
+  /**
+   * Export the canvas to an SVG file. The rendered page is embedded as a
+   * base64 PNG `<image>` sized to the page dimensions. A WebGL map cannot be
+   * reconstructed as true vectors, so the map content remains raster.
+   *
+   * @param canvas - The composed export canvas.
+   */
+  private _exportSvg(canvas: HTMLCanvasElement): void {
+    const pngDataUrl = canvas.toDataURL("image/png");
+    const w = canvas.width;
+    const h = canvas.height;
+    // Express the SVG size in physical inches (with a pixel viewBox) so it
+    // reports the correct page size, e.g. 11in x 8.5in for Letter landscape.
+    const dpi = this._effectiveDpi();
+    const widthIn = +(w / dpi).toFixed(4);
+    const heightIn = +(h / dpi).toFixed(4);
+    const svg =
+      `<?xml version="1.0" encoding="UTF-8"?>\n` +
+      `<svg xmlns="http://www.w3.org/2000/svg" ` +
+      `xmlns:xlink="http://www.w3.org/1999/xlink" ` +
+      `width="${widthIn}in" height="${heightIn}in" viewBox="0 0 ${w} ${h}">` +
+      `<image width="${w}" height="${h}" xlink:href="${pngDataUrl}"/>` +
+      `</svg>`;
+
+    const blob = new Blob([svg], { type: "image/svg+xml" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${this._state.filename}.svg`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+
+  /**
+   * Compute a PNG/zlib CRC-32 over the given bytes.
+   *
+   * @param bytes - The bytes to checksum.
+   * @returns The unsigned 32-bit CRC.
+   */
+  private _crc32(bytes: Uint8Array): number {
+    let crc = ~0;
+    for (let i = 0; i < bytes.length; i++) {
+      crc ^= bytes[i];
+      for (let k = 0; k < 8; k++) {
+        crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1));
+      }
+    }
+    return (~crc) >>> 0;
+  }
+
+  /**
+   * Insert a `pHYs` chunk into a PNG so image viewers report the correct
+   * physical (print) size. Canvas-generated PNGs carry no resolution metadata,
+   * so without this a Letter page at 150 DPI is read as ~17x13 inches at 96 DPI.
+   *
+   * @param bytes - The original PNG bytes.
+   * @param dpi - The target resolution in dots per inch.
+   * @returns A new PNG byte array with the resolution embedded.
+   */
+  private _pngWithDpi(bytes: Uint8Array, dpi: number): Uint8Array {
+    // The IHDR chunk always comes first: 8-byte signature + 4 (length) +
+    // 4 (type) + 13 (data) + 4 (CRC) = byte offset 33.
+    const insertAt = 33;
+    if (bytes.length < insertAt) return bytes;
+
+    // Pixels per metre (PNG pHYs unit 1 == metre). 1 inch = 0.0254 m.
+    const ppm = Math.max(1, Math.round(dpi / 0.0254));
+
+    const chunk = new Uint8Array(21); // 4 len + 4 type + 9 data + 4 CRC
+    const view = new DataView(chunk.buffer);
+    view.setUint32(0, 9); // data length
+    chunk[4] = 0x70; // 'p'
+    chunk[5] = 0x48; // 'H'
+    chunk[6] = 0x59; // 'Y'
+    chunk[7] = 0x73; // 's'
+    view.setUint32(8, ppm); // X pixels per unit
+    view.setUint32(12, ppm); // Y pixels per unit
+    chunk[16] = 1; // unit specifier: metre
+    view.setUint32(17, this._crc32(chunk.subarray(4, 17))); // CRC over type+data
+
+    const out = new Uint8Array(bytes.length + chunk.length);
+    out.set(bytes.subarray(0, insertAt), 0);
+    out.set(chunk, insertAt);
+    out.set(bytes.subarray(insertAt), insertAt + chunk.length);
+    return out;
+  }
+
+  /**
+   * Patch the JFIF APP0 density fields of a JPEG so it reports the correct DPI.
+   *
+   * @param bytes - The original JPEG bytes (mutated in place).
+   * @param dpi - The target resolution in dots per inch.
+   * @returns The same byte array with the density fields set when a JFIF
+   *   header is present.
+   */
+  private _jpegWithDpi(bytes: Uint8Array, dpi: number): Uint8Array {
+    // SOI (FFD8) followed by an APP0 (FFE0) "JFIF\0" segment.
+    const hasJfif =
+      bytes.length > 18 &&
+      bytes[2] === 0xff &&
+      bytes[3] === 0xe0 &&
+      bytes[6] === 0x4a && // J
+      bytes[7] === 0x46 && // F
+      bytes[8] === 0x49 && // I
+      bytes[9] === 0x46; // F
+    if (!hasJfif) return bytes;
+
+    const d = Math.max(1, Math.min(0xffff, Math.round(dpi)));
+    bytes[13] = 1; // density units: dots per inch
+    bytes[14] = (d >> 8) & 0xff; // X density (high)
+    bytes[15] = d & 0xff; // X density (low)
+    bytes[16] = (d >> 8) & 0xff; // Y density (high)
+    bytes[17] = d & 0xff; // Y density (low)
+    return bytes;
+  }
+
+  /**
+   * Re-encode a raster blob with embedded DPI metadata.
+   *
+   * @param blob - The PNG or JPEG blob produced by the canvas.
+   * @param format - The raster format.
+   * @returns A new blob carrying the current DPI, or the original on failure.
+   */
+  private async _embedDpi(
+    blob: Blob,
+    format: "png" | "jpeg",
+  ): Promise<Blob> {
+    try {
+      const bytes = new Uint8Array(await blob.arrayBuffer());
+      const dpi = this._effectiveDpi();
+      if (format === "png") {
+        const out = this._pngWithDpi(bytes, dpi);
+        return new Blob([out as unknown as BlobPart], { type: "image/png" });
+      }
+      const out = this._jpegWithDpi(bytes, dpi);
+      return new Blob([out as unknown as BlobPart], { type: "image/jpeg" });
+    } catch {
+      return blob;
+    }
+  }
+
+  /**
+   * Read a blob as a base64 data URL.
+   *
+   * @param blob - The blob to encode.
+   * @returns The data URL string.
+   */
+  private _blobToDataUrl(blob: Blob): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result));
+      reader.onerror = () => reject(new Error("Failed to read image blob"));
+      reader.readAsDataURL(blob);
+    });
   }
 
   /**
@@ -770,8 +1191,7 @@ export class PrintControl implements IControl {
    */
   private _drawColorbar(
     ctx: CanvasRenderingContext2D,
-    targetWidth: number,
-    targetHeight: number,
+    content: Rect,
     titleBarHeight: number,
   ): void {
     const config = this._state.colorbar;
@@ -810,17 +1230,17 @@ export class PrintControl implements IControl {
         6 +
         (label ? labelFontSize + 6 : 0);
 
-    // Determine position
+    // Determine position (relative to the content rect)
     let x: number, y: number;
     if (position.includes("left")) {
-      x = padding;
+      x = content.x + padding;
     } else {
-      x = targetWidth - totalWidth - padding;
+      x = content.x + content.w - totalWidth - padding;
     }
     if (position.includes("top")) {
-      y = Math.max(padding, titleBarHeight + padding);
+      y = Math.max(content.y + padding, content.y + titleBarHeight + padding);
     } else {
-      y = targetHeight - totalHeight - padding;
+      y = content.y + content.h - totalHeight - padding;
     }
 
     ctx.save();
@@ -1133,9 +1553,8 @@ export class PrintControl implements IControl {
    */
   private _drawScaleBar(
     ctx: CanvasRenderingContext2D,
-    targetWidth: number,
-    targetHeight: number,
-    mapCanvasWidth: number,
+    content: Rect,
+    scaleX: number,
   ): void {
     if (!this._map) return;
 
@@ -1147,10 +1566,10 @@ export class PrintControl implements IControl {
       (156543.03392804097 * Math.cos((center.lat * Math.PI) / 180)) / 2 ** zoom;
     if (!Number.isFinite(metersPerPixel) || metersPerPixel <= 0) return;
 
-    const scaleX = targetWidth / mapCanvasWidth;
+    // Export pixels per source map pixel (uniform draw scale).
     const pixelScale = scaleX;
 
-    const targetBarPx = Math.max(80, Math.min(160, targetWidth * 0.16));
+    const targetBarPx = Math.max(80, Math.min(160, content.w * 0.16));
     const rawMeters = (targetBarPx / pixelScale) * metersPerPixel;
     const niceMeters = this._niceDistance(rawMeters);
     const barPx = Math.max(40, (niceMeters / metersPerPixel) * pixelScale);
@@ -1158,12 +1577,12 @@ export class PrintControl implements IControl {
     const padding = 18;
     const barHeight = 10;
     const minHeight = padding + barHeight + 28;
-    if (targetHeight < minHeight) {
+    if (content.h < minHeight) {
       return;
     }
 
-    const x = padding;
-    const y = targetHeight - padding - 24;
+    const x = content.x + padding;
+    const y = content.y + content.h - padding - 24;
 
     ctx.save();
 
@@ -1205,6 +1624,78 @@ export class PrintControl implements IControl {
   }
 
   /**
+   * Compute the export page layout (pixel dimensions, content rect, and the
+   * destination rectangle the map is drawn into) for the current state.
+   *
+   * @param mapCanvas - The captured map canvas, used for the source aspect ratio.
+   * @returns The resolved page layout.
+   */
+  private _getPageLayout(mapCanvas: HTMLCanvasElement): PageLayout {
+    const mapW = mapCanvas.width;
+    const mapH = mapCanvas.height;
+
+    // Legacy 'fit' mode: page is the current canvas (or Custom width/height),
+    // and the map is stretched to fill it, preserving historical behavior.
+    if (this._state.pageSize === "fit") {
+      const pageW = this._state.width || mapW;
+      const pageH = this._state.height || mapH;
+      return {
+        pageW,
+        pageH,
+        content: { x: 0, y: 0, w: pageW, h: pageH },
+        mapDest: { x: 0, y: 0, w: pageW, h: pageH },
+        scaleX: mapW > 0 ? pageW / mapW : 1,
+        clip: false,
+        // dpi is ignored in 'fit' mode, so physical sizing uses a fixed 96 DPI.
+        pageWidthIn: pageW / 96,
+        pageHeightIn: pageH / 96,
+      };
+    }
+
+    // Paper preset: resolve physical inches and orientation.
+    const [portraitW, portraitH] = PAGE_SIZES_INCHES[this._state.pageSize];
+    let orientation = this._state.orientation;
+    if (orientation === "auto") {
+      orientation = mapW >= mapH ? "landscape" : "portrait";
+    }
+    const pageWidthIn = orientation === "landscape" ? portraitH : portraitW;
+    const pageHeightIn = orientation === "landscape" ? portraitW : portraitH;
+
+    const dpi = this._state.dpi > 0 ? this._state.dpi : 96;
+    const pageW = Math.max(1, Math.round(pageWidthIn * dpi));
+    const pageH = Math.max(1, Math.round(pageHeightIn * dpi));
+
+    const marginPx = Math.max(0, Math.round((this._state.margin / 72) * dpi));
+    const contentX = marginPx;
+    const contentY = marginPx;
+    const contentW = Math.max(1, pageW - marginPx * 2);
+    const contentH = Math.max(1, pageH - marginPx * 2);
+
+    // Fit the map into the content rect.
+    const containScale = Math.min(contentW / mapW, contentH / mapH);
+    const coverScale = Math.max(contentW / mapW, contentH / mapH);
+    const scale = this._state.fitMode === "cover" ? coverScale : containScale;
+    const mapDestW = mapW * scale;
+    const mapDestH = mapH * scale;
+
+    return {
+      pageW,
+      pageH,
+      content: { x: contentX, y: contentY, w: contentW, h: contentH },
+      mapDest: {
+        x: contentX + (contentW - mapDestW) / 2,
+        y: contentY + (contentH - mapDestH) / 2,
+        w: mapDestW,
+        h: mapDestH,
+      },
+      scaleX: scale,
+      clip: this._state.fitMode === "cover",
+      pageWidthIn,
+      pageHeightIn,
+    };
+  }
+
+  /**
    * Create the export canvas from the map.
    */
   private async _createExportCanvas(): Promise<HTMLCanvasElement | null> {
@@ -1212,19 +1703,33 @@ export class PrintControl implements IControl {
 
     try {
       const mapCanvas = await this._captureMapCanvas();
-      const targetWidth = this._state.width || mapCanvas.width;
-      const targetHeight = this._state.height || mapCanvas.height;
+      const layout = this._getPageLayout(mapCanvas);
+      const { pageW, pageH, content, mapDest } = layout;
 
       const exportCanvas = document.createElement("canvas");
-      exportCanvas.width = targetWidth;
-      exportCanvas.height = targetHeight;
+      exportCanvas.width = pageW;
+      exportCanvas.height = pageH;
       const ctx = exportCanvas.getContext("2d");
       if (!ctx) return null;
 
-      // Draw the map canvas (scaled if custom size)
-      ctx.drawImage(mapCanvas, 0, 0, targetWidth, targetHeight);
+      // Fill the page background (visible in margins and letterboxed areas).
+      // Skipped in legacy 'fit' mode so transparent map pixels are preserved.
+      if (this._state.pageSize !== "fit") {
+        ctx.fillStyle = this._state.pageBackground;
+        ctx.fillRect(0, 0, pageW, pageH);
+      }
 
-      // Draw title overlay if set
+      // Draw the map, clipping to the content rect when cropping ('cover').
+      ctx.save();
+      if (layout.clip) {
+        ctx.beginPath();
+        ctx.rect(content.x, content.y, content.w, content.h);
+        ctx.clip();
+      }
+      ctx.drawImage(mapCanvas, mapDest.x, mapDest.y, mapDest.w, mapDest.h);
+      ctx.restore();
+
+      // Draw title overlay if set (spans the content area).
       const title = this._state.title.trim();
       let titleBarHeight = 0;
       if (title) {
@@ -1237,33 +1742,33 @@ export class PrintControl implements IControl {
 
         // Draw title background
         ctx.fillStyle = this._options.titleBackground;
-        ctx.fillRect(0, 0, targetWidth, titleBarHeight);
+        ctx.fillRect(content.x, content.y, content.w, titleBarHeight);
 
         // Draw title text
         ctx.fillStyle = this._options.titleFontColor;
         ctx.textBaseline = "middle";
-        const x = (targetWidth - metrics.width) / 2;
-        ctx.fillText(title, x, titleBarHeight / 2);
+        const x = content.x + (content.w - metrics.width) / 2;
+        ctx.fillText(title, x, content.y + titleBarHeight / 2);
       }
 
       if (this._state.includeNorthArrow) {
-        const arrowSize = Math.max(44, Math.min(72, targetWidth * 0.07));
+        const arrowSize = Math.max(44, Math.min(72, content.w * 0.07));
         const minCanvasWidthForArrow = arrowSize + 18;
 
-        if (targetWidth >= minCanvasWidthForArrow) {
-          const arrowX = targetWidth - arrowSize - 18;
-          const arrowY = Math.max(18, titleBarHeight + 8);
+        if (content.w >= minCanvasWidthForArrow) {
+          const arrowX = content.x + content.w - arrowSize - 18;
+          const arrowY = Math.max(content.y + 18, content.y + titleBarHeight + 8);
           const bearing = this._map.getBearing();
           this._drawNorthArrow(ctx, arrowX, arrowY, arrowSize, bearing);
         }
       }
 
       if (this._state.includeScaleBar) {
-        this._drawScaleBar(ctx, targetWidth, targetHeight, mapCanvas.width);
+        this._drawScaleBar(ctx, content, layout.scaleX);
       }
 
       if (this._state.colorbar.enabled) {
-        this._drawColorbar(ctx, targetWidth, targetHeight, titleBarHeight);
+        this._drawColorbar(ctx, content, titleBarHeight);
       }
 
       return exportCanvas;
@@ -1294,6 +1799,10 @@ export class PrintControl implements IControl {
         await this._exportPdf(canvas);
         this._showFeedback("Exported!");
         this._emit("export");
+      } else if (this._state.format === "svg") {
+        this._exportSvg(canvas);
+        this._showFeedback("Exported!");
+        this._emit("export");
       } else {
         const mimeType =
           this._state.format === "jpeg" ? "image/jpeg" : "image/png";
@@ -1312,8 +1821,14 @@ export class PrintControl implements IControl {
           return;
         }
 
+        // Embed DPI metadata so viewers report the correct physical page size.
+        const outBlob = await this._embedDpi(
+          blob,
+          this._state.format === "jpeg" ? "jpeg" : "png",
+        );
+
         // Trigger download
-        const url = URL.createObjectURL(blob);
+        const url = URL.createObjectURL(outBlob);
         const a = document.createElement("a");
         a.href = url;
         a.download = `${this._state.filename}.${ext}`;
@@ -1322,7 +1837,8 @@ export class PrintControl implements IControl {
         document.body.removeChild(a);
         URL.revokeObjectURL(url);
 
-        const dataUrl = canvas.toDataURL(mimeType, quality);
+        // Emit the same DPI-patched image that was downloaded.
+        const dataUrl = await this._blobToDataUrl(outBlob);
         this._showFeedback("Exported!");
         this._emit("export", { dataUrl });
       }
@@ -1438,7 +1954,7 @@ export class PrintControl implements IControl {
   /**
    * Set the export format.
    */
-  setFormat(format: "png" | "jpeg" | "pdf"): this {
+  setFormat(format: PrintFormat): this {
     this._state.format = format;
     if (this._formatSelect) {
       this._formatSelect.value = format;
@@ -1480,7 +1996,7 @@ export class PrintControl implements IControl {
    * Export the map programmatically and return a data URL.
    */
   async exportMap(options?: {
-    format?: "png" | "jpeg" | "pdf";
+    format?: PrintFormat;
     quality?: number;
     filename?: string;
     title?: string;
@@ -1489,6 +2005,12 @@ export class PrintControl implements IControl {
     colorbar?: PrintColorbarConfig;
     width?: number;
     height?: number;
+    pageSize?: PrintPageSize;
+    orientation?: PrintOrientation;
+    dpi?: number;
+    margin?: number;
+    pageBackground?: string;
+    fitMode?: PrintFitMode;
   }): Promise<string> {
     // Apply temporary overrides
     const prevState = { ...this._state, colorbar: { ...this._state.colorbar } };
@@ -1507,6 +2029,14 @@ export class PrintControl implements IControl {
     }
     if (options?.width) this._state.width = options.width;
     if (options?.height) this._state.height = options.height;
+    if (options?.pageSize) this._state.pageSize = options.pageSize;
+    if (options?.orientation) this._state.orientation = options.orientation;
+    if (options?.dpi) this._state.dpi = options.dpi;
+    if (options?.margin !== undefined) this._state.margin = options.margin;
+    if (options?.pageBackground !== undefined) {
+      this._state.pageBackground = options.pageBackground;
+    }
+    if (options?.fitMode) this._state.fitMode = options.fitMode;
 
     try {
       const canvas = await this._createExportCanvas();
@@ -1520,12 +2050,28 @@ export class PrintControl implements IControl {
         return "";
       }
 
+      if (this._state.format === "svg") {
+        this._exportSvg(canvas);
+        this._emit("export");
+        return "";
+      }
+
       const mimeType =
         this._state.format === "jpeg" ? "image/jpeg" : "image/png";
       const quality =
         this._state.format === "jpeg" ? this._state.quality : undefined;
 
-      const dataUrl = canvas.toDataURL(mimeType, quality);
+      const blob = await new Promise<Blob | null>((resolve) => {
+        canvas.toBlob((b) => resolve(b), mimeType, quality);
+      });
+      if (!blob) {
+        throw new Error("Failed to create image blob");
+      }
+      const outBlob = await this._embedDpi(
+        blob,
+        this._state.format === "jpeg" ? "jpeg" : "png",
+      );
+      const dataUrl = await this._blobToDataUrl(outBlob);
       this._emit("export", { dataUrl });
       return dataUrl;
     } finally {
@@ -1539,6 +2085,12 @@ export class PrintControl implements IControl {
       this._state.colorbar = prevState.colorbar;
       this._state.width = prevState.width;
       this._state.height = prevState.height;
+      this._state.pageSize = prevState.pageSize;
+      this._state.orientation = prevState.orientation;
+      this._state.dpi = prevState.dpi;
+      this._state.margin = prevState.margin;
+      this._state.pageBackground = prevState.pageBackground;
+      this._state.fitMode = prevState.fitMode;
     }
   }
 

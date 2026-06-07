@@ -1054,7 +1054,10 @@ export interface ViewStateControlOptions {
   panelWidth?: number;
   /** Maximum height of the panel in pixels before scrolling. Default: 500. */
   maxHeight?: number;
-  /** Background color of the container. */
+  /**
+   * Background color of the container. When unset (default), the control
+   * adapts to the system light/dark theme via CSS custom properties.
+   */
   backgroundColor?: string;
   /** Border radius for container. */
   borderRadius?: number;
@@ -1062,7 +1065,10 @@ export interface ViewStateControlOptions {
   opacity?: number;
   /** Font size in pixels. */
   fontSize?: number;
-  /** Font color. */
+  /**
+   * Font color of the panel. When unset (default), the panel text adapts to
+   * the system light/dark theme via CSS custom properties.
+   */
   fontColor?: string;
   /** Minimum zoom level at which the control is visible. */
   minzoom?: number;
@@ -2789,7 +2795,10 @@ export interface MeasureControlOptions {
   panelWidth?: number;
   /** Maximum height of the panel in pixels before scrolling. Default: 500. */
   maxHeight?: number;
-  /** Background color of the panel. Default: 'rgba(255, 255, 255, 0.95)'. */
+  /**
+   * Background color of the panel. When unset (default), the panel adapts to
+   * the system light/dark theme via CSS custom properties.
+   */
   backgroundColor?: string;
   /** Border radius in pixels. Default: 4. */
   borderRadius?: number;
@@ -2797,7 +2806,10 @@ export interface MeasureControlOptions {
   opacity?: number;
   /** Font size in pixels. Default: 12. */
   fontSize?: number;
-  /** Font color. Default: '#333'. */
+  /**
+   * Font color of the panel. When unset (default), the panel text adapts to
+   * the system light/dark theme via CSS custom properties.
+   */
   fontColor?: string;
   /** Minimum zoom level at which the control is visible. */
   minzoom?: number;
@@ -3017,13 +3029,19 @@ export interface BookmarkControlOptions {
   panelWidth?: number;
   /** Maximum height of the panel in pixels before scrolling. Default: 500. */
   maxHeight?: number;
-  /** Background color. Default: 'rgba(255, 255, 255, 0.95)'. */
+  /**
+   * Background color of the panel. When unset (default), the panel adapts to
+   * the system light/dark theme via CSS custom properties.
+   */
   backgroundColor?: string;
   /** Border radius in pixels. Default: 4. */
   borderRadius?: number;
   /** Font size in pixels. Default: 12. */
   fontSize?: number;
-  /** Font color. Default: '#333'. */
+  /**
+   * Font color of the panel. When unset (default), the panel text adapts to
+   * the system light/dark theme via CSS custom properties.
+   */
   fontColor?: string;
   /** Minimum zoom level at which the control is visible. */
   minzoom?: number;
@@ -3099,6 +3117,36 @@ export interface PrintColorbarConfig {
 }
 
 /**
+ * Standard page size presets for print export. `'fit'` keeps the current map
+ * canvas size (legacy behavior); the others are physical paper sizes.
+ */
+export type PrintPageSize =
+  | "fit"
+  | "a3"
+  | "a4"
+  | "a5"
+  | "letter"
+  | "legal"
+  | "tabloid";
+
+/**
+ * Page orientation for print export. `'auto'` follows the map aspect ratio.
+ */
+export type PrintOrientation = "auto" | "portrait" | "landscape";
+
+/**
+ * How the map is fitted into the page content area when the map aspect ratio
+ * differs from the page aspect ratio. `'contain'` letterboxes the whole map;
+ * `'cover'` fills the page and crops the overflow.
+ */
+export type PrintFitMode = "contain" | "cover";
+
+/**
+ * Supported export formats for the PrintControl.
+ */
+export type PrintFormat = "png" | "jpeg" | "pdf" | "svg";
+
+/**
  * Options for configuring the PrintControl.
  */
 export interface PrintControlOptions {
@@ -3111,7 +3159,7 @@ export interface PrintControlOptions {
   /** Whether to start collapsed. Default: true. */
   collapsed?: boolean;
   /** Default image format. Default: 'png'. */
-  format?: "png" | "jpeg" | "pdf";
+  format?: PrintFormat;
   /** JPEG quality (0-1). Default: 0.92. */
   quality?: number;
   /** Default filename (without extension). Default: 'map-export'. */
@@ -3136,11 +3184,41 @@ export interface PrintControlOptions {
   width?: number;
   /** Height override for export (pixels). If not set, uses current canvas size. */
   height?: number;
+  /**
+   * Page size for export. `'fit'` (default) uses the current map canvas size
+   * (or the Custom width/height) and preserves legacy behavior. Any paper
+   * preset combines with `dpi` to determine the output pixel dimensions and is
+   * used as the PDF/SVG page size.
+   */
+  pageSize?: PrintPageSize;
+  /** Page orientation. `'auto'` (default) follows the map aspect ratio. */
+  orientation?: PrintOrientation;
+  /**
+   * Output resolution in dots per inch. Combined with a paper `pageSize` it
+   * determines the export pixel dimensions (pixels = inches x dpi). Ignored
+   * when `pageSize` is `'fit'`. Default: 96.
+   */
+  dpi?: number;
+  /** Page margin in points (1/72 inch) around the map. Ignored for `'fit'`. Default: 0. */
+  margin?: number;
+  /** Background color filled behind the map and in the margins. Default: '#ffffff'. */
+  pageBackground?: string;
+  /**
+   * How the map is fitted into the page content area when aspect ratios
+   * differ. `'contain'` (default) letterboxes; `'cover'` crops. Ignored for
+   * `'fit'`.
+   */
+  fitMode?: PrintFitMode;
+  /** Whether to show the page options (size/orientation/DPI) in the panel. Default: false. */
+  showPageOptions?: boolean;
   /** Panel width in pixels. Default: 280. */
   panelWidth?: number;
   /** Maximum height of the panel in pixels before scrolling. Default: 500. */
   maxHeight?: number;
-  /** Background color of the panel. Default: 'rgba(255, 255, 255, 0.95)'. */
+  /**
+   * Background color of the panel. When unset (default), the panel adapts to
+   * the system light/dark theme via CSS custom properties.
+   */
   backgroundColor?: string;
   /** Border radius in pixels. Default: 4. */
   borderRadius?: number;
@@ -3148,7 +3226,10 @@ export interface PrintControlOptions {
   opacity?: number;
   /** Font size in pixels. Default: 12. */
   fontSize?: number;
-  /** Font color. Default: '#333'. */
+  /**
+   * Font color of the panel. When unset (default), the panel text adapts to
+   * the system light/dark theme via CSS custom properties.
+   */
   fontColor?: string;
   /** Minimum zoom level at which the control is visible. */
   minzoom?: number;
@@ -3165,7 +3246,7 @@ export interface PrintControlState {
   /** Whether the panel is collapsed. */
   collapsed: boolean;
   /** Current image format. */
-  format: "png" | "jpeg" | "pdf";
+  format: PrintFormat;
   /** JPEG quality (0-1). */
   quality: number;
   /** Current filename (without extension). */
@@ -3184,6 +3265,18 @@ export interface PrintControlState {
   width: number | null;
   /** Custom height (null = use current canvas size). */
   height: number | null;
+  /** Page size for export. */
+  pageSize: PrintPageSize;
+  /** Page orientation. */
+  orientation: PrintOrientation;
+  /** Output resolution in dots per inch. */
+  dpi: number;
+  /** Page margin in points. */
+  margin: number;
+  /** Background color filled behind the map and margins. */
+  pageBackground: string;
+  /** How the map is fitted into the page content area. */
+  fitMode: PrintFitMode;
 }
 
 /**

@@ -29,6 +29,7 @@ const pmtilesControl = new PMTilesLayerControl({
   loadDefaultUrl: true,
 });
 
+await pmtilesControl.addLayer('/layers/intermixed.pmtiles');
 
 // Create an adapter to integrate PMTiles layers with the layer control
 const pmtilesAdapter = new PMTilesLayerAdapter(pmtilesControl, {

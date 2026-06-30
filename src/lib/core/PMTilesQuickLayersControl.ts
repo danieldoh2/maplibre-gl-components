@@ -30,11 +30,11 @@ export interface PMTilesQuickPreset {
 }
 
 const QUICK_PRESETS: PMTilesQuickPreset[] = [
-  { label: "Pull Arden", url: "https://pub-c15989b388764a34beb256902bc67bc9.r2.dev/arden.pmtiles" },
-  { label: "Pull Bermuda", url: "https://pub-c15989b388764a34beb256902bc67bc9.r2.dev/bermuda_agg.pmtiles" },
+  { label: "Arden", url: "https://pub-c15989b388764a34beb256902bc67bc9.r2.dev/arden.pmtiles" },
+  { label: "Bermuda", url: "https://pub-c15989b388764a34beb256902bc67bc9.r2.dev/bermuda_agg.pmtiles" },
   { label: "WUI", url: "https://pub-c15989b388764a34beb256902bc67bc9.r2.dev/intermixed.pmtiles" },
   { label: "Burned CA Properties", url: "https://pub-c15989b388764a34beb256902bc67bc9.r2.dev/postfires.pmtiles" },
-    { label: "US Zip Codes", url: "https://pub-c15989b388764a34beb256902bc67bc9.r2.dev/postfires.pmtiles" }
+    { label: "US Zip Codes", url: "https://r2-public.protomaps.com/protomaps-sample-datasets/cb_2018_us_zcta510_500k.pmtiles" }
 
 ];
 

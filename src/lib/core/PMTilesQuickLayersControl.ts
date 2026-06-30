@@ -1,0 +1,1223 @@
+import "../styles/common.css";
+import "../styles/pmtiles-layer.css";
+import {
+  type IControl,
+  type Map as MapLibreMap,
+  type MapMouseEvent,
+  Popup,
+} from "maplibre-gl";
+import { generateDistinctColors } from "../utils/color";
+import type {
+  PMTilesLayerControlOptions,
+  PMTilesLayerControlState,
+  PMTilesLayerEvent,
+  PMTilesLayerEventHandler,
+  PMTilesLayerInfo,
+  PMTilesTileType,
+} from "./types";
+
+/**
+ * Grid/tiles icon - represents tiled map data in PMTiles format.
+ */
+const PMTILES_ICON = `<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18"/><path d="M3 15h18"/><path d="M9 3v18"/><path d="M15 3v18"/></svg>`;
+
+/**
+ * Hardcoded quick-access PMTiles presets. Fill in the URLs below.
+ */
+export interface PMTilesQuickPreset {
+  label: string;
+  url: string;
+}
+
+const QUICK_PRESETS: PMTilesQuickPreset[] = [
+  { label: "Arden", url: "https://pub-c15989b388764a34beb256902bc67bc9.r2.dev/arden.pmtiles" },
+  { label: "Bermuda", url: "https://pub-c15989b388764a34beb256902bc67bc9.r2.dev/bermuda_agg.pmtiles" },
+  { label: "WUI", url: "https://pub-c15989b388764a34beb256902bc67bc9.r2.dev/intermixed.pmtiles" },
+  { label: "Burned CA Properties", url: "https://pub-c15989b388764a34beb256902bc67bc9.r2.dev/postfires.pmtiles" },
+    { label: "US Zip Codes", url: "https://r2-public.protomaps.com/protomaps-sample-datasets/cb_2018_us_zcta510_500k.pmtiles" }
+
+];
+
+/**
+ * Default options for the PMTilesQuickLayersControl.
+ */
+const DEFAULT_OPTIONS: Required<PMTilesLayerControlOptions> = {
+  position: "top-right",
+  className: "",
+  visible: true,
+  collapsed: true,
+  beforeId: "",
+  defaultUrl: "",
+  loadDefaultUrl: false,
+  defaultOpacity: 1,
+  defaultFillColor: "steelblue",
+  defaultLineColor: "#333333",
+  defaultCircleColor: "steelblue",
+  defaultLayerName: "",
+  defaultPickable: true,
+  panelWidth: 300,
+  maxHeight: 500,
+  backgroundColor: "rgba(255, 255, 255, 0.95)",
+  borderRadius: 4,
+  opacity: 1,
+  fontSize: 13,
+  fontColor: "#333",
+  minzoom: 0,
+  maxzoom: 24,
+};
+
+/**
+ * The subset of a PMTiles archive header needed to decide how to frame a
+ * newly added layer.
+ */
+export interface PMTilesHeaderExtent {
+  minLon: number;
+  minLat: number;
+  maxLon: number;
+  maxLat: number;
+  centerLon?: number;
+  centerLat?: number;
+  maxZoom: number;
+}
+
+/**
+ * Where the map should move to in order to show a freshly added PMTiles layer.
+ */
+export type PMTilesViewTarget =
+  | { type: "bounds"; bounds: [[number, number], [number, number]] }
+  | { type: "center"; center: [number, number]; zoom: number }
+  | null;
+
+/**
+ * Decides how to frame a newly added PMTiles layer.
+ *
+ * The archive's bounds are the authoritative extent of its data, so they are
+ * preferred. The optional center field is used only as a fallback, when the
+ * bounds are missing or degenerate (zero-width or zero-height). Many PMTiles
+ * archives (notably Overture Maps exports) leave the center at its 0,0,0
+ * default; flying to that center drops the map on "null island" in the Gulf
+ * of Guinea instead of the data, so it must never be trusted over real bounds.
+ *
+ * @param header - The PMTiles archive header.
+ * @returns The view target, or null when neither bounds nor center are usable.
+ */
+export function resolvePMTilesViewTarget(
+  header: PMTilesHeaderExtent,
+): PMTilesViewTarget {
+  const { minLon, minLat, maxLon, maxLat } = header;
+  const hasUsableBounds =
+    Number.isFinite(minLon) &&
+    Number.isFinite(minLat) &&
+    Number.isFinite(maxLon) &&
+    Number.isFinite(maxLat) &&
+    maxLon > minLon &&
+    maxLat > minLat;
+
+  if (hasUsableBounds) {
+    return {
+      type: "bounds",
+      bounds: [
+        [minLon, minLat],
+        [maxLon, maxLat],
+      ],
+    };
+  }
+
+  if (header.centerLon !== undefined && header.centerLat !== undefined) {
+    return {
+      type: "center",
+      center: [header.centerLon, header.centerLat],
+      // Clamp to a valid zoom: archives with a very low maxZoom (0 or 1)
+      // would otherwise yield a negative flyTo zoom.
+      zoom: Math.max(0, Math.min(header.maxZoom - 2, 14)),
+    };
+  }
+
+  return null;
+}
+
+/**
+ * A control for adding PMTiles layers to the map via 4 hardcoded quick-access
+ * buttons instead of a free-text URL input.
+ *
+ * Supports both vector and raster PMTiles files.
+ *
+ * @example
+ * ```typescript
+ * const pmtilesControl = new PMTilesQuickLayersControl();
+ * map.addControl(pmtilesControl, 'top-right');
+ *
+ * pmtilesControl.on('layeradd', (event) => {
+ *   console.log('PMTiles layer added:', event.url);
+ * });
+ * ```
+ */
+export class PMTilesQuickLayersControl implements IControl {
+  private _container?: HTMLElement;
+  private _button?: HTMLButtonElement;
+  private _panel?: HTMLElement;
+  private _options: Required<PMTilesLayerControlOptions>;
+  private _state: PMTilesLayerControlState;
+  private _eventHandlers: Map<
+    PMTilesLayerEvent,
+    Set<PMTilesLayerEventHandler>
+  > = new Map();
+  private _map?: MapLibreMap;
+  private _handleZoom?: () => void;
+  private _zoomVisible: boolean = true;
+  private _pmtilesLayers: Map<string, PMTilesLayerInfo> = new Map();
+  private _layerCounter = 0;
+  private _protocolRegistered = false;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private _protocol?: any;
+  private _popup?: Popup;
+  private _clickHandler?: (e: MapMouseEvent) => void;
+
+  constructor(options?: PMTilesLayerControlOptions) {
+    this._options = { ...DEFAULT_OPTIONS, ...options };
+    this._state = {
+      visible: this._options.visible,
+      collapsed: this._options.collapsed,
+      url: this._options.defaultUrl,
+      layerName: this._options.defaultLayerName,
+      layerOpacity: this._options.defaultOpacity,
+      availableSourceLayers: [],
+      selectedSourceLayers: [],
+      pickable: this._options.defaultPickable,
+      hasLayer: false,
+      layerCount: 0,
+      layers: [],
+      loading: false,
+      error: null,
+      status: null,
+    };
+  }
+
+  onAdd(map: MapLibreMap): HTMLElement {
+    this._map = map;
+    this._container = this._createContainer();
+    this._render();
+
+    this._handleZoom = () => this._checkZoomVisibility();
+    this._map.on("zoom", this._handleZoom);
+    this._checkZoomVisibility();
+
+    // Set up click handler for pickable features
+    this._setupClickHandler();
+
+    // Auto-load default URL if specified
+    if (this._options.loadDefaultUrl && this._options.defaultUrl) {
+      const loadLayer = () => {
+        this._addLayer(this._options.defaultUrl);
+      };
+      // Use 'idle' event for more reliable layer loading
+      if (this._map.isStyleLoaded()) {
+        setTimeout(loadLayer, 100);
+      } else {
+        this._map.once("idle", loadLayer);
+      }
+    }
+
+    return this._container;
+  }
+
+  onRemove(): void {
+    this._removeLayer(); // Remove all layers on cleanup
+
+    if (this._map && this._handleZoom) {
+      this._map.off("zoom", this._handleZoom);
+      this._handleZoom = undefined;
+    }
+
+    // Clean up click handler
+    if (this._map && this._clickHandler) {
+      this._map.off("click", this._clickHandler);
+      this._clickHandler = undefined;
+    }
+
+    // Clean up popup
+    if (this._popup) {
+      this._popup.remove();
+      this._popup = undefined;
+    }
+
+    this._map = undefined;
+    this._container?.parentNode?.removeChild(this._container);
+    this._container = undefined;
+    this._button = undefined;
+    this._panel = undefined;
+    this._eventHandlers.clear();
+  }
+
+  show(): void {
+    if (!this._state.visible) {
+      this._state.visible = true;
+      this._updateDisplayState();
+      this._emit("show");
+    }
+  }
+
+  hide(): void {
+    if (this._state.visible) {
+      this._state.visible = false;
+      this._updateDisplayState();
+      this._emit("hide");
+    }
+  }
+
+  expand(): void {
+    if (this._state.collapsed) {
+      this._state.collapsed = false;
+      this._render();
+      this._emit("expand");
+    }
+  }
+
+  collapse(): void {
+    if (!this._state.collapsed) {
+      this._state.collapsed = true;
+      this._render();
+      this._emit("collapse");
+    }
+  }
+
+  toggle(): void {
+    if (this._state.collapsed) this.expand();
+    else this.collapse();
+  }
+
+  getState(): PMTilesLayerControlState {
+    return { ...this._state };
+  }
+
+  update(options: Partial<PMTilesLayerControlOptions>): void {
+    this._options = { ...this._options, ...options };
+    if (options.visible !== undefined) this._state.visible = options.visible;
+    if (options.collapsed !== undefined)
+      this._state.collapsed = options.collapsed;
+    this._render();
+    this._emit("update");
+  }
+
+  on(event: PMTilesLayerEvent, handler: PMTilesLayerEventHandler): void {
+    if (!this._eventHandlers.has(event)) {
+      this._eventHandlers.set(event, new Set());
+    }
+    this._eventHandlers.get(event)!.add(handler);
+  }
+
+  off(event: PMTilesLayerEvent, handler: PMTilesLayerEventHandler): void {
+    this._eventHandlers.get(event)?.delete(handler);
+  }
+
+  /**
+   * Programmatically add a PMTiles layer.
+   */
+  async addLayer(url?: string): Promise<void> {
+    await this._addLayer(url ?? this._state.url);
+  }
+
+  /**
+   * Programmatically remove a PMTiles layer by ID, or all layers if no ID given.
+   */
+  removeLayer(id?: string): void {
+    this._removeLayer(id);
+    this._render();
+  }
+
+  /**
+   * Get all PMTiles layer IDs.
+   */
+  getLayerIds(): string[] {
+    const ids: string[] = [];
+    for (const info of this._pmtilesLayers.values()) {
+      ids.push(...info.layerIds);
+    }
+    return ids;
+  }
+
+  /**
+   * Find the source info that contains a specific layer ID.
+   */
+  private _findSourceByLayerId(layerId: string): PMTilesLayerInfo | undefined {
+    for (const info of this._pmtilesLayers.values()) {
+      if (info.layerIds.includes(layerId)) {
+        return info;
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Get the opacity of a layer (by layer ID or source ID).
+   */
+  getLayerOpacity(id: string): number | null {
+    // Check if it's a source ID first
+    let info = this._pmtilesLayers.get(id);
+    // If not found, check if it's a layer ID
+    if (!info) {
+      info = this._findSourceByLayerId(id);
+    }
+    return info?.opacity ?? null;
+  }
+
+  /**
+   * Set the opacity of a layer (by layer ID or source ID).
+   * If layer ID is provided, sets opacity for that specific layer.
+   * If source ID is provided, sets opacity for all layers from that source.
+   */
+  setLayerOpacity(id: string, opacity: number): void {
+    if (!this._map) return;
+    const clampedOpacity = Math.max(0, Math.min(1, opacity));
+
+    // Check if it's a source ID
+    const sourceInfo = this._pmtilesLayers.get(id);
+    if (sourceInfo) {
+      // Set opacity for all layers in the source
+      sourceInfo.opacity = clampedOpacity;
+      for (const layerId of sourceInfo.layerIds) {
+        this._setLayerOpacityDirect(layerId, clampedOpacity);
+      }
+      return;
+    }
+
+    // Check if it's a layer ID
+    const info = this._findSourceByLayerId(id);
+    if (info) {
+      // Set opacity for this specific layer only
+      this._setLayerOpacityDirect(id, clampedOpacity);
+    }
+  }
+
+  /**
+   * Set opacity directly on a MapLibre layer.
+   */
+  private _setLayerOpacityDirect(layerId: string, opacity: number): void {
+    if (!this._map) return;
+    const layer = this._map.getLayer(layerId);
+    if (!layer) return;
+
+    const type = layer.type;
+    if (type === "fill") {
+      this._map.setPaintProperty(layerId, "fill-opacity", opacity * 0.6);
+    } else if (type === "line") {
+      this._map.setPaintProperty(layerId, "line-opacity", opacity);
+    } else if (type === "circle") {
+      this._map.setPaintProperty(layerId, "circle-opacity", opacity);
+    } else if (type === "raster") {
+      this._map.setPaintProperty(layerId, "raster-opacity", opacity);
+    }
+  }
+
+  /**
+   * Get the visibility of a layer (by layer ID or source ID).
+   */
+  getLayerVisibility(id: string): boolean {
+    if (!this._map) return false;
+
+    // Check if it's a source ID
+    const sourceInfo = this._pmtilesLayers.get(id);
+    if (sourceInfo && sourceInfo.layerIds.length > 0) {
+      const visibility = this._map.getLayoutProperty(
+        sourceInfo.layerIds[0],
+        "visibility",
+      );
+      return visibility !== "none";
+    }
+
+    // Check if it's a layer ID
+    const info = this._findSourceByLayerId(id);
+    if (info) {
+      const visibility = this._map.getLayoutProperty(id, "visibility");
+      return visibility !== "none";
+    }
+
+    return false;
+  }
+
+  /**
+   * Set the visibility of a layer (by layer ID or source ID).
+   * If layer ID is provided, sets visibility for that specific layer.
+   * If source ID is provided, sets visibility for all layers from that source.
+   */
+  setLayerVisibility(id: string, visible: boolean): void {
+    if (!this._map) return;
+
+    // Check if it's a source ID
+    const sourceInfo = this._pmtilesLayers.get(id);
+    if (sourceInfo) {
+      for (const layerId of sourceInfo.layerIds) {
+        this._map.setLayoutProperty(
+          layerId,
+          "visibility",
+          visible ? "visible" : "none",
+        );
+      }
+      return;
+    }
+
+    // Check if it's a layer ID
+    const info = this._findSourceByLayerId(id);
+    if (info) {
+      this._map.setLayoutProperty(
+        id,
+        "visibility",
+        visible ? "visible" : "none",
+      );
+    }
+  }
+
+  /**
+   * Get the URL for a specific PMTiles source.
+   */
+  getLayerUrl(sourceId: string): string | null {
+    const info = this._pmtilesLayers.get(sourceId);
+    return info?.url ?? null;
+  }
+
+  /**
+   * Get whether features are pickable (clickable) globally or for a specific source.
+   */
+  getPickable(sourceId?: string): boolean {
+    if (sourceId) {
+      const info = this._pmtilesLayers.get(sourceId);
+      return info?.pickable ?? this._state.pickable;
+    }
+    return this._state.pickable;
+  }
+
+  /**
+   * Set whether features are pickable (clickable).
+   * If sourceId is provided, sets pickable for that specific source.
+   * If no sourceId, sets the global pickable state for all current and future layers.
+   */
+  setPickable(pickable: boolean, sourceId?: string): void {
+    if (sourceId) {
+      const info = this._pmtilesLayers.get(sourceId);
+      if (info) {
+        info.pickable = pickable;
+      }
+    } else {
+      this._state.pickable = pickable;
+      // Update all existing layers
+      for (const info of this._pmtilesLayers.values()) {
+        info.pickable = pickable;
+      }
+    }
+    this._render();
+  }
+
+  private _emit(
+    event: PMTilesLayerEvent,
+    extra?: { url?: string; error?: string; layerId?: string },
+  ): void {
+    const handlers = this._eventHandlers.get(event);
+    if (handlers) {
+      const payload = { type: event, state: this.getState(), ...extra };
+      handlers.forEach((h) => h(payload));
+    }
+  }
+
+  private _setupClickHandler(): void {
+    if (!this._map) return;
+
+    this._clickHandler = (e: MapMouseEvent) => {
+      if (!this._map || !this._state.pickable) return;
+
+      // Get all layer IDs from pickable sources
+      const pickableLayerIds: string[] = [];
+      for (const info of this._pmtilesLayers.values()) {
+        if (info.pickable && info.tileType === "vector") {
+          pickableLayerIds.push(...info.layerIds);
+        }
+      }
+
+      if (pickableLayerIds.length === 0) return;
+
+      // Query all features at click point, grouped by source layer
+      const seenSourceLayers = new Set<string>();
+      const layerFeatures: Array<{
+        sourceLayer: string;
+        properties: Record<string, unknown>;
+      }> = [];
+
+      for (const layerId of pickableLayerIds) {
+        if (!this._map.getLayer(layerId)) continue;
+        const features = this._map.queryRenderedFeatures(e.point, {
+          layers: [layerId],
+        });
+        if (features.length > 0) {
+          const sl = features[0].sourceLayer || layerId;
+          if (!seenSourceLayers.has(sl)) {
+            seenSourceLayers.add(sl);
+            layerFeatures.push({
+              sourceLayer: sl,
+              properties: features[0].properties || {},
+            });
+          }
+        }
+      }
+
+      if (layerFeatures.length === 0) {
+        if (this._popup) {
+          this._popup.remove();
+        }
+        return;
+      }
+
+      // Build combined popup content for all layers at this point
+      let html = '<div class="maplibre-gl-pmtiles-popup">';
+      html += '<div class="maplibre-gl-pmtiles-popup-content">';
+
+      for (const { sourceLayer, properties } of layerFeatures) {
+        const friendlyName = sourceLayer.replace(/[-_]/g, " ");
+        html += `<div class="maplibre-gl-pmtiles-popup-header">${friendlyName}</div>`;
+
+        const propEntries = Object.entries(properties);
+        if (propEntries.length === 0) {
+          html +=
+            '<div class="maplibre-gl-pmtiles-popup-empty">No properties</div>';
+        } else {
+          html += '<table class="maplibre-gl-pmtiles-popup-table">';
+          for (const [key, value] of propEntries) {
+            const displayValue =
+              typeof value === "object"
+                ? JSON.stringify(value)
+                : String(value);
+            html += `<tr><td class="maplibre-gl-pmtiles-popup-key">${key}</td><td class="maplibre-gl-pmtiles-popup-value">${displayValue}</td></tr>`;
+          }
+          html += "</table>";
+        }
+      }
+
+      html += "</div></div>";
+
+      // Show popup
+      if (!this._popup) {
+        this._popup = new Popup({
+          closeButton: true,
+          closeOnClick: false,
+          maxWidth: "320px",
+        });
+      }
+
+      this._popup.setLngLat(e.lngLat).setHTML(html).addTo(this._map);
+    };
+
+    this._map.on("click", this._clickHandler);
+  }
+
+  private _checkZoomVisibility(): void {
+    if (!this._map) return;
+    const zoom = this._map.getZoom();
+    const { minzoom, maxzoom } = this._options;
+    const inRange = zoom >= minzoom && zoom <= maxzoom;
+    if (inRange !== this._zoomVisible) {
+      this._zoomVisible = inRange;
+      this._updateDisplayState();
+    }
+  }
+
+  private _updateDisplayState(): void {
+    if (!this._container) return;
+    const shouldShow = this._state.visible && this._zoomVisible;
+    this._container.style.display = shouldShow ? "block" : "none";
+  }
+
+  private _createContainer(): HTMLElement {
+    const container = document.createElement("div");
+    container.className = `maplibregl-ctrl maplibre-gl-pmtiles-layer${
+      this._options.className ? ` ${this._options.className}` : ""
+    }`;
+
+    const shouldShow = this._state.visible && this._zoomVisible;
+    if (!shouldShow) container.style.display = "none";
+
+    Object.assign(container.style, {
+      backgroundColor: this._options.backgroundColor,
+      borderRadius: `${this._options.borderRadius}px`,
+      boxShadow: "0 0 0 2px rgba(0, 0, 0, 0.1)",
+    });
+    if (this._options.opacity !== 1) {
+      container.style.opacity = String(this._options.opacity);
+    }
+
+    return container;
+  }
+
+  private _render(): void {
+    if (!this._container) return;
+
+    // Save scroll position before clearing content
+    const panelEl = this._container.querySelector(
+      ".maplibre-gl-pmtiles-layer-panel",
+    );
+    const scrollTop = panelEl ? panelEl.scrollTop : 0;
+
+    this._container.innerHTML = "";
+
+    if (this._state.collapsed) {
+      this._renderCollapsed();
+    } else {
+      this._renderExpanded();
+    }
+
+    this._updateDisplayState();
+
+    // Restore scroll position
+    if (scrollTop > 0) {
+      const newPanelEl = this._container.querySelector(
+        ".maplibre-gl-pmtiles-layer-panel",
+      );
+      if (newPanelEl) {
+        newPanelEl.scrollTop = scrollTop;
+      }
+    }
+  }
+
+  private _renderCollapsed(): void {
+    if (!this._container) return;
+
+    this._button = document.createElement("button");
+    this._button.type = "button";
+    this._button.className = `maplibre-gl-pmtiles-layer-button${this._state.hasLayer ? " maplibre-gl-pmtiles-layer-button--active" : ""}`;
+    this._button.title = "PMTiles Quick Layers";
+    this._button.setAttribute("aria-label", "PMTiles Quick Layers");
+    this._button.innerHTML = PMTILES_ICON;
+    this._button.addEventListener("click", () => this.expand());
+
+    this._container.appendChild(this._button);
+    this._panel = undefined;
+  }
+
+  private _renderExpanded(): void {
+    if (!this._container) return;
+
+    const panel = document.createElement("div");
+    panel.className = "maplibre-gl-pmtiles-layer-panel";
+    panel.style.width = `${this._options.panelWidth}px`;
+    if (this._options.maxHeight && this._options.maxHeight > 0) {
+      panel.style.maxHeight = `${this._options.maxHeight}px`;
+      panel.style.overflowY = "auto";
+    }
+    this._panel = panel;
+
+    // Header
+    const header = document.createElement("div");
+    header.className = "maplibre-gl-pmtiles-layer-header";
+    const title = document.createElement("span");
+    title.className = "maplibre-gl-pmtiles-layer-title";
+    title.textContent = "PMTiles Quick Layers";
+    header.appendChild(title);
+    const closeBtn = document.createElement("button");
+    closeBtn.className = "maplibre-gl-pmtiles-layer-close";
+    closeBtn.innerHTML = "&times;";
+    closeBtn.title = "Close";
+    closeBtn.addEventListener("click", () => this.collapse());
+    header.appendChild(closeBtn);
+    panel.appendChild(header);
+
+    // Quick preset buttons (replaces URL input)
+    const presetGroup = this._createFormGroup("Quick Layers", "presets");
+    const presetGrid = document.createElement("div");
+    presetGrid.style.display = "grid";
+    presetGrid.style.gridTemplateColumns = "1fr 1fr";
+    presetGrid.style.gap = "6px";
+
+    QUICK_PRESETS.forEach((preset, index) => {
+      const presetBtn = document.createElement("button");
+      presetBtn.className = "maplibre-gl-pmtiles-layer-btn";
+      presetBtn.textContent = preset.label;
+      presetBtn.style.padding = "8px 6px";
+      presetBtn.style.fontSize = "12px";
+      presetBtn.disabled = this._state.loading || !preset.url;
+      presetBtn.title = preset.url || "URL not yet configured";
+      presetBtn.addEventListener("click", () => {
+        this._addLayer(preset.url, preset.label);
+      });
+      presetGrid.appendChild(presetBtn);
+      // Silence unused-index lint in case it's needed later for ordering.
+      void index;
+    });
+
+    presetGroup.appendChild(presetGrid);
+    panel.appendChild(presetGroup);
+
+    // Opacity slider
+    const opacityGroup = this._createFormGroup("Opacity", "opacity");
+    const sliderRow = document.createElement("div");
+    sliderRow.className = "maplibre-gl-pmtiles-layer-slider-row";
+    const slider = document.createElement("input");
+    slider.type = "range";
+    slider.className = "maplibre-gl-pmtiles-layer-slider";
+    slider.min = "0";
+    slider.max = "100";
+    slider.value = String(Math.round(this._state.layerOpacity * 100));
+    const sliderValue = document.createElement("span");
+    sliderValue.className = "maplibre-gl-pmtiles-layer-slider-value";
+    sliderValue.textContent = `${Math.round(this._state.layerOpacity * 100)}%`;
+    slider.addEventListener("input", () => {
+      const pct = Number(slider.value);
+      this._state.layerOpacity = pct / 100;
+      sliderValue.textContent = `${pct}%`;
+      this._updateOpacity();
+    });
+    sliderRow.appendChild(slider);
+    sliderRow.appendChild(sliderValue);
+    opacityGroup.appendChild(sliderRow);
+    panel.appendChild(opacityGroup);
+
+    // Pickable checkbox
+    const pickableGroup = this._createFormGroup("Interactivity", "pickable");
+    const pickableRow = document.createElement("div");
+    pickableRow.style.display = "flex";
+    pickableRow.style.alignItems = "center";
+    pickableRow.style.gap = "6px";
+
+    const pickableCheckbox = document.createElement("input");
+    pickableCheckbox.type = "checkbox";
+    pickableCheckbox.id = "pmtiles-layer-pickable";
+    pickableCheckbox.checked = this._state.pickable;
+    pickableCheckbox.addEventListener("change", () => {
+      this.setPickable(pickableCheckbox.checked);
+    });
+
+    const pickableLabel = document.createElement("label");
+    pickableLabel.htmlFor = "pmtiles-layer-pickable";
+    pickableLabel.textContent = "Enable feature picking (click to inspect)";
+    pickableLabel.style.fontSize = "12px";
+    pickableLabel.style.cursor = "pointer";
+
+    pickableRow.appendChild(pickableCheckbox);
+    pickableRow.appendChild(pickableLabel);
+    pickableGroup.appendChild(pickableRow);
+    panel.appendChild(pickableGroup);
+
+    // Before ID input (for layer ordering)
+    const beforeIdGroup = this._createFormGroup(
+      "Before Layer ID (optional)",
+      "before-id",
+    );
+    const beforeIdInput = document.createElement("input");
+    beforeIdInput.type = "text";
+    beforeIdInput.className = "maplibre-gl-pmtiles-layer-input";
+    beforeIdInput.style.color = "#000";
+    beforeIdInput.placeholder = "e.g. labels or water";
+    beforeIdInput.value = this._options.beforeId || "";
+    beforeIdInput.addEventListener("input", () => {
+      this._options.beforeId = beforeIdInput.value || "";
+    });
+    beforeIdGroup.appendChild(beforeIdInput);
+    panel.appendChild(beforeIdGroup);
+
+    // Status/error area
+    if (this._state.loading) {
+      this._appendStatus("Loading PMTiles...", "info");
+    } else if (this._state.error) {
+      this._appendStatus(this._state.error, "error");
+    } else if (this._state.status) {
+      this._appendStatus(this._state.status, "success");
+    }
+
+    // Layer list
+    if (this._pmtilesLayers.size > 0) {
+      const listContainer = document.createElement("div");
+      listContainer.className = "maplibre-gl-pmtiles-layer-list";
+
+      const listHeader = document.createElement("div");
+      listHeader.className = "maplibre-gl-pmtiles-layer-list-header";
+      listHeader.textContent = `Layers (${this._pmtilesLayers.size})`;
+      listContainer.appendChild(listHeader);
+
+      for (const [sourceId, info] of this._pmtilesLayers) {
+        const item = document.createElement("div");
+        item.className = "maplibre-gl-pmtiles-layer-list-item";
+
+        const label = document.createElement("span");
+        label.className = "maplibre-gl-pmtiles-layer-list-label";
+        let displayName: string;
+        if (info.name) {
+          displayName = info.name;
+        } else {
+          try {
+            const urlObj = new URL(info.url);
+            displayName = urlObj.pathname.split("/").pop() || info.url;
+          } catch {
+            displayName = info.url;
+          }
+        }
+        label.textContent = displayName;
+        label.title = info.url;
+
+        // Add badge for tile type
+        const badge = document.createElement("span");
+        badge.className = `maplibre-gl-pmtiles-layer-badge${info.tileType === "raster" ? " maplibre-gl-pmtiles-layer-badge--raster" : ""}`;
+        badge.textContent = info.tileType;
+        label.appendChild(badge);
+
+        item.appendChild(label);
+
+        const removeBtn = document.createElement("button");
+        removeBtn.className = "maplibre-gl-pmtiles-layer-list-remove";
+        removeBtn.innerHTML = "&times;";
+        removeBtn.title = "Remove layer";
+        removeBtn.addEventListener("click", () => {
+          this._removeLayer(sourceId);
+          this._render();
+        });
+        item.appendChild(removeBtn);
+
+        listContainer.appendChild(item);
+      }
+
+      panel.appendChild(listContainer);
+    }
+
+    this._container.appendChild(panel);
+    this._button = undefined;
+  }
+
+  private _createFormGroup(labelText: string, id: string): HTMLElement {
+    const group = document.createElement("div");
+    group.className = "maplibre-gl-pmtiles-layer-form-group";
+    const label = document.createElement("label");
+    label.textContent = labelText;
+    label.htmlFor = `pmtiles-layer-${id}`;
+    group.appendChild(label);
+    return group;
+  }
+
+  private _appendStatus(
+    message: string,
+    type: "info" | "error" | "success",
+  ): void {
+    if (!this._panel) return;
+    const status = document.createElement("div");
+    status.className = `maplibre-gl-pmtiles-layer-status maplibre-gl-pmtiles-layer-status--${type}`;
+    status.textContent = message;
+    this._panel.appendChild(status);
+  }
+
+  private async _ensureProtocol(): Promise<void> {
+    if (this._protocolRegistered) return;
+
+    // Dynamically import pmtiles
+    const pmtiles = await import("pmtiles");
+    this._protocol = new pmtiles.Protocol();
+
+    // Register the protocol with MapLibre
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const maplibregl =
+      (window as any).maplibregl || (await import("maplibre-gl"));
+    if (!maplibregl.config?.REGISTERED_PROTOCOLS?.pmtiles) {
+      maplibregl.addProtocol("pmtiles", this._protocol.tile);
+    }
+
+    this._protocolRegistered = true;
+  }
+
+  private async _addLayer(url: string, layerName?: string): Promise<void> {
+    if (!this._map || !url) {
+      this._state.error = "No PMTiles URL configured for this button yet.";
+      this._render();
+      return;
+    }
+
+    this._state.url = url;
+    if (layerName !== undefined) {
+      this._state.layerName = layerName;
+    }
+    this._state.loading = true;
+    this._state.error = null;
+    this._state.status = null;
+    this._render();
+
+    try {
+      await this._ensureProtocol();
+
+      const pmtiles = await import("pmtiles");
+
+      // Create PMTiles instance to get header info
+      const p = new pmtiles.PMTiles(url);
+      this._protocol.add(p);
+
+      const header = await p.getHeader();
+      const metadata = await p.getMetadata();
+
+      // Determine tile type
+      let tileType: PMTilesTileType = "unknown";
+      if (header.tileType === 1) {
+        tileType = "vector";
+      } else if (
+        header.tileType === 2 ||
+        header.tileType === 3 ||
+        header.tileType === 4
+      ) {
+        tileType = "raster";
+      }
+
+      // Generate unique source ID
+      const sourceId = `pmtiles-source-${this._layerCounter++}`;
+
+      // Add source
+      const pmtilesUrl = `pmtiles://${url}`;
+
+      if (tileType === "vector") {
+        this._map.addSource(sourceId, {
+          type: "vector",
+          url: pmtilesUrl,
+        });
+      } else {
+        this._map.addSource(sourceId, {
+          type: "raster",
+          url: pmtilesUrl,
+          tileSize: 256,
+        });
+      }
+
+      // Get source layers from metadata (for vector tiles)
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const vectorLayers = (metadata as any)?.vector_layers || [];
+      const sourceLayers: string[] = vectorLayers.map(
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (l: any) => l.id as string,
+      );
+
+      const layerIds: string[] = [];
+      const beforeId =
+        this._options.beforeId && this._map.getLayer(this._options.beforeId)
+          ? this._options.beforeId
+          : undefined;
+
+      // Track per-source-layer colors for this PMTiles source
+      const sourceLayerColors: Record<string, string> = {};
+
+      if (tileType === "vector") {
+        // Render all source layers found in the archive's metadata.
+        const layersToRender = sourceLayers;
+
+        // Generate distinct colors for each source layer
+        const colors = generateDistinctColors(layersToRender.length);
+
+        // Add layers for each source layer
+        for (let i = 0; i < layersToRender.length; i++) {
+          const sourceLayer = layersToRender[i];
+          const color = colors[i];
+          sourceLayerColors[sourceLayer] = color;
+
+          // Determine layer type based on geometry (simplified - add all types)
+          const fillLayerId = `${sourceId}-${sourceLayer}-fill`;
+          const lineLayerId = `${sourceId}-${sourceLayer}-line`;
+          const circleLayerId = `${sourceId}-${sourceLayer}-circle`;
+
+          // Add fill layer
+          this._map.addLayer(
+            {
+              id: fillLayerId,
+              type: "fill",
+              source: sourceId,
+              "source-layer": sourceLayer,
+              paint: {
+                "fill-color": color,
+                "fill-opacity": this._state.layerOpacity * 0.6,
+              },
+              filter: ["==", ["geometry-type"], "Polygon"],
+            },
+            beforeId,
+          );
+          layerIds.push(fillLayerId);
+
+          // Add line layer
+          this._map.addLayer(
+            {
+              id: lineLayerId,
+              type: "line",
+              source: sourceId,
+              "source-layer": sourceLayer,
+              paint: {
+                "line-color": color,
+                "line-opacity": this._state.layerOpacity,
+                "line-width": 1,
+              },
+              filter: [
+                "any",
+                ["==", ["geometry-type"], "LineString"],
+                ["==", ["geometry-type"], "Polygon"],
+              ],
+            },
+            beforeId,
+          );
+          layerIds.push(lineLayerId);
+
+          // Add circle layer for points
+          this._map.addLayer(
+            {
+              id: circleLayerId,
+              type: "circle",
+              source: sourceId,
+              "source-layer": sourceLayer,
+              paint: {
+                "circle-color": color,
+                "circle-opacity": this._state.layerOpacity,
+                "circle-radius": 2,
+                "circle-stroke-color": color,
+                "circle-stroke-width": 0.5,
+              },
+              filter: ["==", ["geometry-type"], "Point"],
+            },
+            beforeId,
+          );
+          layerIds.push(circleLayerId);
+        }
+
+        // If no source layers found, try adding a generic layer
+        if (layersToRender.length === 0) {
+          const genericLayerId = `${sourceId}-generic`;
+          this._map.addLayer(
+            {
+              id: genericLayerId,
+              type: "fill",
+              source: sourceId,
+              paint: {
+                "fill-color": this._options.defaultFillColor,
+                "fill-opacity": this._state.layerOpacity * 0.6,
+              },
+            },
+            beforeId,
+          );
+          layerIds.push(genericLayerId);
+        }
+      } else {
+        // Add raster layer
+        const rasterLayerId = `${sourceId}-raster`;
+        this._map.addLayer(
+          {
+            id: rasterLayerId,
+            type: "raster",
+            source: sourceId,
+            paint: {
+              "raster-opacity": this._state.layerOpacity,
+            },
+          },
+          beforeId,
+        );
+        layerIds.push(rasterLayerId);
+      }
+
+      // Frame the newly added layer. Prefer the archive's bounds (the
+      // authoritative extent of the data) and only fall back to its declared
+      // center when those bounds are degenerate. See resolvePMTilesViewTarget:
+      // many archives (e.g. Overture exports) leave the center at 0,0, which
+      // would otherwise fly the map to "null island" instead of the data.
+      const viewTarget = resolvePMTilesViewTarget(header);
+      if (viewTarget?.type === "bounds") {
+        this._map.fitBounds(viewTarget.bounds, {
+          padding: 40,
+          duration: 1000,
+        });
+      } else if (viewTarget?.type === "center") {
+        this._map.flyTo({
+          center: viewTarget.center,
+          zoom: viewTarget.zoom,
+          duration: 1000,
+        });
+      }
+
+      // Store layer info
+      const customName = this._state.layerName?.trim();
+      const layerInfo: PMTilesLayerInfo = {
+        id: sourceId,
+        name: customName || undefined,
+        url,
+        tileType,
+        sourceLayers,
+        layerIds,
+        opacity: this._state.layerOpacity,
+        pickable: this._state.pickable,
+        sourceLayerColors,
+      };
+      this._pmtilesLayers.set(sourceId, layerInfo);
+
+      this._state.hasLayer = this._pmtilesLayers.size > 0;
+      this._state.layerCount = this._pmtilesLayers.size;
+      this._state.layers = Array.from(this._pmtilesLayers.values());
+      this._state.loading = false;
+      this._state.status = `PMTiles layer added (${tileType}).`;
+      this._state.layerName = "";
+      this._render();
+      this._emit("layeradd", { url, layerId: sourceId });
+    } catch (err) {
+      this._state.loading = false;
+      this._state.error = `Failed to load PMTiles: ${err instanceof Error ? err.message : String(err)}`;
+      this._render();
+      this._emit("error", { error: this._state.error });
+    }
+  }
+
+  private _removeLayer(id?: string): void {
+    if (!this._map) return;
+
+    if (id) {
+      // Remove a specific source and its layers
+      const info = this._pmtilesLayers.get(id);
+      if (info) {
+        for (const layerId of info.layerIds) {
+          try {
+            if (this._map.getLayer(layerId)) {
+              this._map.removeLayer(layerId);
+            }
+          } catch {
+            // Layer may already be removed
+          }
+        }
+        try {
+          if (this._map.getSource(id)) {
+            this._map.removeSource(id);
+          }
+        } catch {
+          // Source may already be removed
+        }
+      }
+      this._pmtilesLayers.delete(id);
+      this._state.hasLayer = this._pmtilesLayers.size > 0;
+      this._state.layerCount = this._pmtilesLayers.size;
+      this._state.layers = Array.from(this._pmtilesLayers.values());
+      this._state.status = null;
+      this._state.error = null;
+      this._emit("layerremove", { layerId: id });
+    } else {
+      // Remove all layers (cleanup)
+      for (const [sourceId, info] of this._pmtilesLayers) {
+        for (const layerId of info.layerIds) {
+          try {
+            if (this._map.getLayer(layerId)) {
+              this._map.removeLayer(layerId);
+            }
+          } catch {
+            // ignore
+          }
+        }
+        try {
+          if (this._map.getSource(sourceId)) {
+            this._map.removeSource(sourceId);
+          }
+        } catch {
+          // ignore
+        }
+      }
+      this._pmtilesLayers.clear();
+      this._state.hasLayer = false;
+      this._state.layerCount = 0;
+      this._state.layers = [];
+      this._state.status = null;
+      this._state.error = null;
+      this._emit("layerremove");
+    }
+  }
+
+  private _updateOpacity(): void {
+    for (const [sourceId] of this._pmtilesLayers) {
+      this.setLayerOpacity(sourceId, this._state.layerOpacity);
+    }
+  }
+}
